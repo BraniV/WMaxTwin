@@ -1,0 +1,516 @@
+# ============================================================
+# WMaxTwin+ Claw Density Simulation in R
+# ============================================================
+# This code mirrors the Python program used for Example I.
+# It uses only base R and the stats package.
+
+# -----------------------------
+# User controls
+# -----------------------------
+REPS <- 150             # Use 150 for the paper table. Use 20 or 50 for a quick check.
+SEED <- 20260619
+H <- 0.11
+OUTPUT_DIR <- "r_notebook_outputs"
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+
+set.seed(SEED)
+
+# -----------------------------
+# Utility functions
+# -----------------------------
+
+pick_one <- function(v) {
+  v[sample.int(length(v), 1)]
+}
+
+shuffle_vec <- function(v) {
+  if (length(v) <= 1) return(v)
+  v[sample.int(length(v), length(v), replace = FALSE)]
+}
+
+trapz <- function(x, y) {
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+array_split <- function(idx, R) {
+  n <- length(idx)
+  q <- n %/% R
+  r <- n %% R
+  sizes <- rep(q, R)
+  if (r > 0) sizes[seq_len(r)] <- sizes[seq_len(r)] + 1
+  out <- vector("list", R)
+  start <- 1
+  for (i in seq_len(R)) {
+    stop <- start + sizes[i] - 1
+    out[[i]] <- idx[start:stop]
+    start <- stop + 1
+  }
+  out
+}
+
+# ============================================================
+# 1. Claw density
+# ============================================================
+
+claw_pdf <- function(x) {
+  y <- 0.5 * dnorm(x, mean = 0, sd = 1)
+  for (ell in 0:4) {
+    y <- y + 0.1 * dnorm(x, mean = ell / 2 - 1, sd = 0.1)
+  }
+  y
+}
+
+sample_claw <- function(n) {
+  comp <- sample(0:5, size = n, replace = TRUE, prob = c(0.5, rep(0.1, 5)))
+  means <- c(0, -1, -0.5, 0, 0.5, 1)
+  sds <- c(1, rep(0.1, 5))
+  rnorm(n, mean = means[comp + 1], sd = sds[comp + 1])
+}
+
+# ============================================================
+# 2. Feature construction
+# ============================================================
+
+standardize_columns <- function(F) {
+  F <- as.matrix(F)
+  F <- scale(F, center = TRUE, scale = FALSE)
+  sds <- apply(F, 2, sd)
+  keep <- which(sds > 1e-12)
+  if (length(keep) == 0) stop("All feature columns are constant.")
+  F <- F[, keep, drop = FALSE]
+  sweep(F, 2, sds[keep], FUN = "/")
+}
+
+rank_coordinate <- function(x) {
+  rank(x, ties.method = "first") / (length(x) + 1)
+}
+
+maxtwin_plus_features <- function(x, R = 10, M = NULL) {
+  if (is.null(M)) M <- R
+  z <- as.numeric((x - mean(x)) / (sd(x) + 1e-12))
+  u <- rank_coordinate(x)
+
+  cols <- list(z, z^2, z^3, z^4)
+
+  for (r in 0:(R - 1)) {
+    lo <- r / R
+    hi <- (r + 1) / R
+    cols[[length(cols) + 1]] <- as.numeric(u > lo & u <= hi)
+  }
+
+  tau <- 1.2 / (M + 1)
+  for (m in 1:M) {
+    c0 <- m / (M + 1)
+    cols[[length(cols) + 1]] <- exp(-0.5 * ((u - c0) / tau)^2)
+  }
+
+  standardize_columns(do.call(cbind, cols))
+}
+
+haar_wavelet_features <- function(x, J = 5, J0 = NULL, a = -3, b = 3) {
+  if (is.null(J0)) J0 <- max(1, J - 3)
+
+  u <- pmax(pmin((x - a) / (b - a), 1 - 1e-12), 0)
+  cols <- list()
+
+  for (j in J0:J) {
+    m <- 2^j
+    raw <- u * m
+    bins0 <- floor(raw)
+    loc <- raw - bins0
+    bins <- bins0 + 1
+    scale <- 2^(j / 2)
+
+    for (k in 1:m) {
+      v <- rep(0, length(u))
+      idx <- which(bins == k)
+      if (length(idx) > 0) {
+        v[idx] <- ifelse(loc[idx] < 0.5, 1, -1) * scale
+      }
+      cols[[length(cols) + 1]] <- v
+    }
+  }
+
+  # Finest scaling indicators. These make the split sensitive to local mass.
+  m <- 2^J
+  raw <- u * m
+  bins <- floor(raw) + 1
+  scale <- 2^(J / 2)
+  for (k in 1:m) {
+    cols[[length(cols) + 1]] <- as.numeric(bins == k) * scale
+  }
+
+  standardize_columns(do.call(cbind, cols))
+}
+
+wmaxtwin_plus_features <- function(x, R = 10, J = 5) {
+  Fm <- maxtwin_plus_features(x, R = R, M = R)
+  Fw <- haar_wavelet_features(x, J = J)
+  Fm <- Fm / sqrt(ncol(Fm))
+  Fw <- Fw / sqrt(ncol(Fw))
+  cbind(Fm, Fw)
+}
+
+feature_objective <- function(F, y) {
+  s <- as.numeric(crossprod(F, y))
+  sum(s^2) / ncol(F)
+}
+
+feature_diagnostics <- function(x, y_random, y_max, y_wmax, R = 10, J = 5) {
+  Fm <- maxtwin_plus_features(x, R = R, M = R)
+  Fw <- haar_wavelet_features(x, J = J)
+  Fall <- wmaxtwin_plus_features(x, R = R, J = J)
+  data.frame(
+    Method = c("Random", "MaxTwin_plus", "WMaxTwin_plus"),
+    MaxTwin_features = c(feature_objective(Fm, y_random),
+                         feature_objective(Fm, y_max),
+                         feature_objective(Fm, y_wmax)),
+    Haar_features = c(feature_objective(Fw, y_random),
+                      feature_objective(Fw, y_max),
+                      feature_objective(Fw, y_wmax)),
+    Combined_features = c(feature_objective(Fall, y_random),
+                          feature_objective(Fall, y_max),
+                          feature_objective(Fall, y_wmax))
+  )
+}
+
+# ============================================================
+# 3. Split constructors
+# ============================================================
+
+random_split <- function(n) {
+  y <- c(rep(1L, n %/% 2), rep(-1L, n - n %/% 2))
+  shuffle_vec(y)
+}
+
+maxtwin_plus_split <- function(x, R = 10, n_flips = 600) {
+  n <- length(x)
+  idx <- order(x)
+  blocks <- array_split(idx, R)
+  block_id <- integer(n)
+  y <- integer(n)
+  leftovers <- integer(0)
+
+  for (bi in seq_along(blocks)) {
+    bidx <- blocks[[bi]]
+    block_id[bidx] <- bi
+    bcopy <- shuffle_vec(bidx)
+    m <- length(bcopy) %/% 2
+    if (m > 0) {
+      y[bcopy[1:m]] <- 1L
+      y[bcopy[(m + 1):(2 * m)]] <- -1L
+    }
+    if (length(bcopy) %% 2 == 1) {
+      leftovers <- c(leftovers, bcopy[length(bcopy)])
+    }
+  }
+
+  # Assign odd-block leftovers while preserving balanced split size.
+  if (length(leftovers) > 0) {
+    leftovers <- shuffle_vec(leftovers)
+    n_plus <- sum(y == 1L)
+    target_plus <- n %/% 2
+    for (ii in leftovers) {
+      if (n_plus < target_plus) {
+        y[ii] <- 1L
+        n_plus <- n_plus + 1
+      } else {
+        y[ii] <- -1L
+      }
+    }
+  }
+
+  F <- maxtwin_plus_features(x, R = R, M = R)
+  s <- as.numeric(crossprod(F, y))
+  cur <- sum(s^2) / ncol(F)
+
+  # Swaps are restricted within the same rank block, preserving block balance.
+  for (iter in seq_len(n_flips)) {
+    bi <- sample.int(R, 1)
+    inds <- which(block_id == bi)
+    pp <- inds[y[inds] == 1L]
+    mm <- inds[y[inds] == -1L]
+    if (length(pp) == 0 || length(mm) == 0) next
+
+    ip <- pick_one(pp)
+    im <- pick_one(mm)
+    ds <- -2 * F[ip, ] + 2 * F[im, ]
+    ns <- s + ds
+    new <- sum(ns^2) / ncol(F)
+
+    if (new < cur) {
+      y[ip] <- -1L
+      y[im] <- 1L
+      s <- ns
+      cur <- new
+    }
+  }
+  y
+}
+
+orient_adjacent_pairs <- function(pairs, F, restarts = 10, sweeps = 5) {
+  D <- F[pairs[, 1], , drop = FALSE] - F[pairs[, 2], , drop = FALSE]
+  m <- nrow(D)
+  best_sgn <- NULL
+  best_obj <- Inf
+
+  for (rr in seq_len(restarts)) {
+    sgn <- sample(c(-1L, 1L), size = m, replace = TRUE)
+    vec <- as.numeric(crossprod(D, sgn))
+    cur <- sum(vec^2) / ncol(F)
+
+    for (sweep in seq_len(sweeps)) {
+      improved <- FALSE
+      for (q in sample.int(m, m)) {
+        new_vec <- vec - 2 * sgn[q] * D[q, ]
+        new_obj <- sum(new_vec^2) / ncol(F)
+        if (new_obj < cur) {
+          vec <- new_vec
+          cur <- new_obj
+          sgn[q] <- -sgn[q]
+          improved <- TRUE
+        }
+      }
+      if (!improved) break
+    }
+
+    if (cur < best_obj) {
+      best_obj <- cur
+      best_sgn <- sgn
+    }
+  }
+  best_sgn
+}
+
+wmaxtwin_plus_split <- function(x, R = 10, J = 5, restarts = 10) {
+  n <- length(x)
+  if (n %% 2 != 0) stop("The adjacent-pair implementation requires even n.")
+  idx <- order(x)
+  pairs <- matrix(idx, ncol = 2, byrow = TRUE)
+  F <- wmaxtwin_plus_features(x, R = R, J = J)
+  sgn <- orient_adjacent_pairs(pairs, F, restarts = restarts, sweeps = 5)
+
+  y <- integer(n)
+  for (q in seq_len(nrow(pairs))) {
+    y[pairs[q, 1]] <- sgn[q]
+    y[pairs[q, 2]] <- -sgn[q]
+  }
+  y
+}
+
+# ============================================================
+# 4. AMSE calculation
+# ============================================================
+
+kde_eval <- function(x, grid, h) {
+  z <- outer(grid, x, FUN = "-") / h
+  rowMeans(dnorm(z)) / h
+}
+
+split_amse <- function(x, y, grid, true_pdf, h) {
+  f_plus <- kde_eval(x[y == 1], grid, h)
+  f_minus <- kde_eval(x[y == -1], grid, h)
+  ise_plus <- trapz(grid, (f_plus - true_pdf)^2)
+  ise_minus <- trapz(grid, (f_minus - true_pdf)^2)
+  0.5 * (ise_plus + ise_minus)
+}
+
+# ============================================================
+# 5. Monte Carlo simulation
+# ============================================================
+
+run_simulation <- function(reps = REPS, seed = SEED, h = H, output_dir = OUTPUT_DIR) {
+  set.seed(seed)
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+  settings <- data.frame(
+    n = c(60, 80, 80, 120),
+    J = c(5, 5, 6, 5),
+    R = c(8, 10, 10, 12)
+  )
+
+  grid <- seq(-3.5, 3.5, length.out = 701)
+  true_pdf <- claw_pdf(grid)
+
+  rows <- list()
+  row_id <- 1
+  example <- NULL
+
+  for (ss in seq_len(nrow(settings))) {
+    n <- settings$n[ss]
+    J <- settings$J[ss]
+    R <- settings$R[ss]
+
+    for (rep in seq_len(reps)) {
+      x <- sample_claw(n)
+      y_random <- random_split(n)
+      y_max <- maxtwin_plus_split(x, R = R, n_flips = 700)
+      y_wmax <- wmaxtwin_plus_split(x, R = R, J = J, restarts = 10)
+
+      ar <- split_amse(x, y_random, grid, true_pdf, h)
+      am <- split_amse(x, y_max, grid, true_pdf, h)
+      aw <- split_amse(x, y_wmax, grid, true_pdf, h)
+
+      rows[[row_id]] <- data.frame(
+        n = n,
+        J = J,
+        R = R,
+        rep = rep,
+        AMSE_Random = ar,
+        AMSE_MaxTwin_plus = am,
+        AMSE_WMaxTwin_plus = aw,
+        diff_Random_minus_MaxTwin_plus = ar - am,
+        diff_MaxTwin_plus_minus_WMaxTwin_plus = am - aw,
+        abs_signed_overlap = abs(sum(y_max * y_wmax)) / n
+      )
+      row_id <- row_id + 1
+
+      if (is.null(example) && n == 80 && J == 6 && rep == 1) {
+        example <- list(
+          x = x,
+          y_random = y_random,
+          y_max = y_max,
+          y_wmax = y_wmax,
+          grid = grid,
+          true_pdf = true_pdf,
+          h = h,
+          R = R,
+          J = J
+        )
+      }
+    }
+  }
+
+  reps_df <- do.call(rbind, rows)
+
+  groups <- split(reps_df, list(reps_df$n, reps_df$J, reps_df$R), drop = TRUE)
+  summary_rows <- lapply(groups, function(gdf) {
+    mr <- mean(gdf$AMSE_Random)
+    mm <- mean(gdf$AMSE_MaxTwin_plus)
+    mw <- mean(gdf$AMSE_WMaxTwin_plus)
+    data.frame(
+      n = gdf$n[1],
+      J = gdf$J[1],
+      R = gdf$R[1],
+      Random = mr,
+      MaxTwin_plus = mm,
+      WMaxTwin_plus = mw,
+      Gain_WMaxTwin_vs_Random_percent = 100 * (mr - mw) / mr,
+      Gain_WMaxTwin_vs_MaxTwin_percent = 100 * (mm - mw) / mm,
+      Gain_MaxTwin_vs_Random_percent = 100 * (mr - mm) / mr,
+      Median_abs_signed_overlap = median(gdf$abs_signed_overlap),
+      Frac_MaxTwin_better_than_Random = mean(gdf$AMSE_MaxTwin_plus < gdf$AMSE_Random),
+      Frac_WMaxTwin_better_than_MaxTwin = mean(gdf$AMSE_WMaxTwin_plus < gdf$AMSE_MaxTwin_plus)
+    )
+  })
+  summary_df <- do.call(rbind, summary_rows)
+  rownames(summary_df) <- NULL
+  summary_df <- summary_df[order(summary_df$n, summary_df$J, summary_df$R), ]
+
+  write.csv(reps_df, file.path(output_dir, "wmaxtwin_plus_replicates_R.csv"), row.names = FALSE)
+  write.csv(summary_df, file.path(output_dir, "wmaxtwin_plus_amse_table_R.csv"), row.names = FALSE)
+
+  list(summary_df = summary_df, reps_df = reps_df, example = example)
+}
+
+# ============================================================
+# 6. Plotting functions
+# ============================================================
+
+plot_true_claw_density <- function(grid, true_pdf, file = NULL) {
+  if (!is.null(file)) png(file, width = 1200, height = 650, res = 160)
+  on.exit(if (!is.null(file)) dev.off(), add = TRUE)
+  plot(grid, true_pdf, type = "l", lwd = 2,
+       xlab = "x", ylab = "density",
+       main = "Marron-Wand claw density")
+}
+
+plot_split_geometry <- function(example, file = NULL) {
+  if (!is.null(file)) png(file, width = 1200, height = 650, res = 160)
+  on.exit(if (!is.null(file)) dev.off(), add = TRUE)
+  x <- example$x
+  plot(range(x), c(-0.35, 2.35), type = "n", yaxt = "n",
+       xlab = "x", ylab = "", main = "Representative split geometry, n = 80, J = 6")
+  axis(2, at = c(0, 1, 2), labels = c("Random", "MaxTwin+", "WMaxTwin+"), las = 1)
+  points(x, 0 + 0.12 * example$y_random, pch = 16)
+  points(x, 1 + 0.12 * example$y_max, pch = 17)
+  points(x, 2 + 0.12 * example$y_wmax, pch = 15)
+  legend("topright", legend = c("Random", "MaxTwin+", "WMaxTwin+"),
+         pch = c(16, 17, 15), bty = "n")
+}
+
+plot_density_estimates <- function(example, file = NULL) {
+  if (!is.null(file)) png(file, width = 1200, height = 700, res = 160)
+  on.exit(if (!is.null(file)) dev.off(), add = TRUE)
+  x <- example$x
+  grid <- example$grid
+  h <- example$h
+  true_pdf <- example$true_pdf
+  plot(grid, true_pdf, type = "l", lwd = 2, xlab = "x", ylab = "density",
+       main = "Half-sample KDE estimates, n = 80, J = 6")
+  lines(grid, kde_eval(x[example$y_max == 1], grid, h), lty = 2, lwd = 1.4)
+  lines(grid, kde_eval(x[example$y_max == -1], grid, h), lty = 3, lwd = 1.4)
+  lines(grid, kde_eval(x[example$y_wmax == 1], grid, h), lty = 4, lwd = 1.4)
+  lines(grid, kde_eval(x[example$y_wmax == -1], grid, h), lty = 5, lwd = 1.4)
+  legend("topright",
+         legend = c("true density", "MaxTwin+ A", "MaxTwin+ B", "WMaxTwin+ A", "WMaxTwin+ B"),
+         lty = c(1, 2, 3, 4, 5), lwd = c(2, 1.4, 1.4, 1.4, 1.4), bty = "n", cex = 0.85)
+}
+
+plot_amse_bars <- function(summary_df, file = NULL) {
+  if (!is.null(file)) png(file, width = 1200, height = 700, res = 160)
+  on.exit(if (!is.null(file)) dev.off(), add = TRUE)
+  vals <- t(as.matrix(summary_df[, c("Random", "MaxTwin_plus", "WMaxTwin_plus")]))
+  labels <- paste0("n=", summary_df$n, ", J=", summary_df$J)
+  barplot(vals, beside = TRUE, names.arg = labels,
+          ylab = "mean AMSE", main = "AMSE comparison across split geometries",
+          legend.text = c("Random", "MaxTwin+", "WMaxTwin+"),
+          args.legend = list(x = "topright", bty = "n"))
+}
+
+plot_amse_differences <- function(reps_df, file = NULL) {
+  if (!is.null(file)) png(file, width = 1300, height = 700, res = 160)
+  on.exit(if (!is.null(file)) dev.off(), add = TRUE)
+  groups <- split(reps_df, list(reps_df$n, reps_df$J), drop = TRUE)
+  diff_data <- list()
+  diff_labels <- character(0)
+  for (nm in names(groups)) {
+    gdf <- groups[[nm]]
+    diff_data[[length(diff_data) + 1]] <- gdf$diff_Random_minus_MaxTwin_plus
+    diff_labels <- c(diff_labels, paste0("R-M\n", "n=", gdf$n[1], ",J=", gdf$J[1]))
+    diff_data[[length(diff_data) + 1]] <- gdf$diff_MaxTwin_plus_minus_WMaxTwin_plus
+    diff_labels <- c(diff_labels, paste0("M-W\n", "n=", gdf$n[1], ",J=", gdf$J[1]))
+  }
+  boxplot(diff_data, names = diff_labels, outline = FALSE,
+          ylab = "AMSE difference",
+          main = "Positive differences favor MaxTwin+ over Random and WMaxTwin+ over MaxTwin+")
+  abline(h = 0, lwd = 1)
+}
+
+# ============================================================
+# 7. Execute the simulation and make figures
+# ============================================================
+
+result <- run_simulation(reps = REPS, seed = SEED, h = H, output_dir = OUTPUT_DIR)
+summary_df <- result$summary_df
+reps_df <- result$reps_df
+example <- result$example
+
+print(round(summary_df, 5))
+
+plot_true_claw_density(example$grid, example$true_pdf,
+                       file = file.path(OUTPUT_DIR, "fig_claw_density_R.png"))
+plot_split_geometry(example,
+                    file = file.path(OUTPUT_DIR, "fig_wmaxtwin_plus_split_geometry_R.png"))
+plot_density_estimates(example,
+                       file = file.path(OUTPUT_DIR, "fig_wmaxtwin_plus_density_estimates_R.png"))
+plot_amse_bars(summary_df,
+               file = file.path(OUTPUT_DIR, "fig_wmaxtwin_plus_amse_bars_R.png"))
+plot_amse_differences(reps_df,
+                      file = file.path(OUTPUT_DIR, "fig_wmaxtwin_plus_amse_differences_R.png"))
+
+cat("\nFeature-imbalance diagnostic for the representative replicate:\n")
+print(round(feature_diagnostics(example$x, example$y_random, example$y_max,
+                                example$y_wmax, R = example$R, J = example$J), 5))
+
+cat("\nFiles written to:", normalizePath(OUTPUT_DIR), "\n")
