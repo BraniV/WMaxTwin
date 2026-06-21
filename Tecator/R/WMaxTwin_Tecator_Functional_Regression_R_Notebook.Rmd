@@ -1,0 +1,182 @@
+---
+title: "WMaxTwin for Tecator Functional Regression"
+author: "Brani Vidakovic, Youngseo Cho, and V. Roshan Joseph"
+date: "GitHub R notebook"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5)
+```
+
+# Overview
+
+This R notebook reproduces the Tecator functional-regression example from the WMaxTwin paper.
+The goal is to compare validation split geometries for selecting a scalar-on-function regression model.
+The example is conceptually different from the Doppler example: here each spectrum is a **whole functional observation**.  Wavelet features are computed inside each spectrum, and the split is over spectra rather than over wavelength locations.  Therefore there is no irregular-grid DWT problem.
+
+The notebook compares:
+
+- Random splitting,
+- SPlit-style support splitting,
+- Twinning-style representative twins,
+- DUPLEX-style diverse validation splitting,
+- MaxTwin in the raw functional geometry,
+- nested WMaxTwin geometries with positive mixing parameter $\gamma$.
+
+The central nested geometry is
+
+$$
+D_\gamma^2(i,i')=(1-\gamma)D_0^2(i,i')+\gamma D_w^2(i,i'),
+$$
+
+where $D_0$ is the raw standardized spectral distance and $D_w$ is a scale-weighted Haar wavelet distance.  Ordinary MaxTwin is exactly the endpoint $\gamma=0$.
+
+# Why this is the right WMaxTwin setting
+
+For Tecator, the statistical units are meat samples.  Each unit has a full near-infrared spectrum measured over wavelengths from 850 to 1050 nm and a fat-content response.  Since every observation retains its internal grid, it is mathematically safe to compute wavelet coefficients within each spectrum.
+
+WMaxTwin does **not** replace MaxTwin.  It perturbs MaxTwin by adding multiscale spectral geometry.  This is useful when broad spectral differences and wavelength-local contrasts both matter for predicting fat percentage.
+
+# Load the R implementation
+
+The standalone R script is self-contained.  It uses only base R and the recommended `stats` and `utils` packages.
+
+```{r source-code}
+source("wmaxtwin_tecator_functional_regression_R.R")
+```
+
+# Data protocol
+
+The Tecator file is parsed from the local `tecator_statlib.txt` included in this package.  If the file is missing, the script attempts to download it from StatLib.
+
+The protocol is:
+
+- samples 1--172: calibration set,
+- samples 173--215: external test set,
+- remaining extrapolation samples: not used.
+
+All split construction, scale weighting, ridge tuning, and wavelet cutoff tuning are performed inside the 172 calibration samples.  The external test set is used once after tuning and refitting.
+
+```{r load-data}
+download_tecator(DATA_PATH)
+dat <- load_tecator(DATA_PATH)
+ip <- interp_to_power2(dat$X, dat$wavelengths, m = 128)
+X128 <- ip$X
+wl128 <- ip$grid
+y_fat <- dat$endpoints[, "fat"]
+
+cat("Number of spectra:", nrow(X128), "\n")
+cat("Number of interpolated wavelength grid points:", ncol(X128), "\n")
+cat("Calibration samples:", 172, "\n")
+cat("External test samples:", 43, "\n")
+```
+
+# Functional regression model
+
+Each standardized spectrum is represented in an orthonormal Haar basis.  For a maximum retained resolution $j_{\max}$, the scalar-on-function regression model is
+
+$$
+Y_i = \alpha + \sum_{\ell\in {\cal I}(j_{\max})} b_\ell c_{i\ell}+\varepsilon_i,
+$$
+
+where $c_{i\ell}$ is the Haar coefficient of spectrum $i$.  The ridge penalty and $j_{\max}$ are selected by an internal train-validation split of the calibration sample.
+
+# Run the study
+
+For a quick GitHub run, the notebook uses `R_REPS <- 8`, matching the pilot table used in the paper draft.  Increase this to 50 or 100 for a smoother Monte Carlo study.
+
+```{r run-study}
+R_REPS <- 8
+ans <- run_study(R = R_REPS, seed = 20260619)
+summary_table <- ans$summary
+weights_table <- data.frame(scale_j = as.integer(names(ans$weights)), weight = as.numeric(ans$weights))
+```
+
+# Calibration-only scale weights
+
+The scale weights are estimated using calibration data only:
+
+$$
+w_j \propto {1\over |{\cal K}_j|}\sum_{k\in {\cal K}_j}
+\widehat{\operatorname{Cor}}^2(d_{ijk},Y_i), \qquad \sum_j w_j=1.
+$$
+
+They are **not** raw wavelet energy weights.  They quantify scale-level association with fat response inside the calibration set.
+
+```{r scale-weights}
+print(weights_table, row.names = FALSE)
+```
+
+# Reproduced split-comparison table
+
+The table reports the selected wavelet cutoff, selected ridge penalty, validation MSE inside the calibration sample, and external test RMSE after refitting on all calibration samples.
+
+```{r summary-table}
+print(summary_table, row.names = FALSE)
+```
+
+# Figures
+
+The R script writes all figures to `tecator_wmaxtwin_outputs_R/`.
+
+## Calibration spectra
+
+```{r fig-spectra, echo=FALSE, out.width='90%'}
+knitr::include_graphics(file.path(ans$outdir, "fig1_tecator_spectra.png"))
+```
+
+## Mean spectra by fat-content quartile
+
+```{r fig-quartiles, echo=FALSE, out.width='90%'}
+knitr::include_graphics(file.path(ans$outdir, "fig2_quartile_mean_spectra.png"))
+```
+
+## Response-informed wavelet scale weights
+
+```{r fig-weights, echo=FALSE, out.width='75%'}
+knitr::include_graphics(file.path(ans$outdir, "fig3_response_scale_weights.png"))
+```
+
+## Example validation curves
+
+```{r fig-val-curves, echo=FALSE, out.width='90%'}
+knitr::include_graphics(file.path(ans$outdir, "fig4_validation_curves_rep0.png"))
+```
+
+## External test RMSE
+
+```{r fig-rmse, echo=FALSE, out.width='95%'}
+knitr::include_graphics(file.path(ans$outdir, "fig5_test_rmse_boxplot.png"))
+```
+
+## Selected wavelet cutoff
+
+```{r fig-jmax, echo=FALSE, out.width='95%'}
+knitr::include_graphics(file.path(ans$outdir, "fig6_selected_jmax_boxplot.png"))
+```
+
+## Selected ridge penalty
+
+```{r fig-alpha, echo=FALSE, out.width='95%'}
+knitr::include_graphics(file.path(ans$outdir, "fig7_selected_alpha_boxplot.png"))
+```
+
+## Nested $\gamma$ path
+
+```{r fig-gamma, echo=FALSE, out.width='80%'}
+knitr::include_graphics(file.path(ans$outdir, "fig8_gamma_path_rmse.png"))
+```
+
+# Interpretation
+
+The purpose of this example is not to claim that WMaxTwin is automatically better than every split.  The purpose is to study the nested path from MaxTwin to WMaxTwin.  MaxTwin corresponds to $\gamma=0$.  Positive values of $\gamma$ add scale-weighted wavelet geometry while preserving the MaxTwin idea of paired, representative validation design.
+
+The scientifically important diagnostic is whether moderate positive $\gamma$ values improve or stabilize external prediction relative to the raw MaxTwin endpoint.  In the paper's Python run, moderate WMaxTwin perturbations improve the external RMSE relative to MaxTwin, while very large perturbations are less favorable.  This supports the cautious interpretation: wavelet geometry should complement raw functional geometry rather than overwhelm it.
+
+# Reference outputs
+
+This package includes `reference_outputs_from_python/`, produced by the executed Python notebook.  Because R and NumPy use different random-number generators, individual random orientations may differ slightly.  The main diagnostic should be the same qualitative pattern and the same calibration-only scale weights.
