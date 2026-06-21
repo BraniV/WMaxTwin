@@ -1,0 +1,186 @@
+---
+title: "WMaxTwin Doppler/Nason Cross-Validation in R"
+author: "Brani Vidakovic, Youngseo Cho, and V. Roshan Joseph"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 4.8)
+```
+
+# Purpose
+
+This notebook is an annotated R version of Example II in the WMaxTwin paper.
+The example revisits Nason-type wavelet cross-validation for the Doppler signal
+and compares:
+
+1. the noisy signal,
+2. levelwise SURE thresholding,
+3. Nason's even/odd cross-validation benchmark,
+4. a location-only MaxTwin split with a fixed threshold family,
+5. WMaxTwin with a multiscale split and a high-frequency ramp threshold family,
+6. an oracle ramp benchmark that uses the true signal and is not available in practice.
+
+The important methodological point is not that WMaxTwin simply replaces Nason's
+even/odd split.  For a single gridded signal, an arbitrary MaxTwin or WMaxTwin
+mask is generally not a dyadic subgrid.  Therefore one should not apply an
+ordinary DWT to the retained observations.  The fit used here is a masked
+wavelet penalized least-squares fit on the original grid.
+
+# Mathematical setup
+
+The Doppler signal is
+
+$$
+f_0(t)=\{t(1-t)\}^{1/2}\sin\left({2\pi\,1.05\over t+0.05}\right),
+\qquad 0<t<1.
+$$
+
+The signal is centered and rescaled so that the signal-to-noise ratio is
+$SNR=7$ when $\sigma=1$.  The observations are
+
+$$
+y_i=f(t_i)+\epsilon_i,
+\qquad
+\epsilon_i\sim N(0,\sigma^2),
+\qquad
+ t_i={i-1/2\over n}.
+$$
+
+We use $n=1024$, Symmlet 4, and wavelet levels $j=3,\ldots,9$.
+
+# What the mask means
+
+For one MaxTwin or WMaxTwin split, each original grid location $t_i$ is assigned
+to one of two halves.  For a given masked fit, the training indicator is
+
+$$
+m_i=
+\begin{cases}
+1, & \hbox{if } y_i \hbox{ is used for training},\\
+0, & \hbox{if } y_i \hbox{ is held out for validation}.
+\end{cases}
+$$
+
+The masked wavelet fit is
+
+$$
+\widehat d_\lambda
+=
+\arg\min_d
+\left[
+{1\over 2}\sum_{i=1}^n m_i\{y_i-(W'd)_i\}^2
++
+\sum_{j=3}^{9}\lambda_j\sum_k |d_{jk}|
+\right].
+$$
+
+The scaling coefficients at level 3 are not penalized.  The estimator is solved
+by FISTA using only applications of $W$ and $W'$.  This is a row-restricted
+wavelet regression problem on the original grid.  It is not a DWT of the retained
+observations treated as a shorter regular signal.
+
+# WMaxTwin feature geometry
+
+The WMaxTwin feature vector at grid location $t_i$ is
+
+$$
+u_i=
+\left(t_i,
+\sqrt{\omega_3}q_i^{(3)},
+\sqrt{\omega_4}q_i^{(4)},
+\ldots,
+\sqrt{\omega_9}q_i^{(9)}
+\right),
+$$
+
+where $q_i^{(j)}$ is a standardized local activity measure from the level $j$
+wavelet detail contribution.  The paper weights are
+
+| Level $j$ | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| $\omega_j$ | 0.015 | 0.036 | 0.074 | 0.124 | 0.182 | 0.248 | 0.321 |
+
+Thus the WMaxTwin geometry gives most of the multiscale emphasis to the active
+high-frequency levels $7,8,9$, without removing the lower levels.
+
+# R implementation
+
+The file `wmaxtwin_doppler_nason_cv_R.R` contains a fully self-contained R
+implementation of the periodic Symmlet 4 DWT/IDWT, masked FISTA fitting,
+Nason/MaxTwin/WMaxTwin splits, cross-validation, and plotting.  No wavelet R
+package is required.
+
+```{r source-code}
+RUN_MAIN <- FALSE
+source("wmaxtwin_doppler_nason_cv_R.R")
+```
+
+# Check the WMaxTwin feature weights
+
+```{r weights}
+J <- as.integer(log2(N))
+wmaxtwin_scale_weights(J0, J, mode = WEIGHT_MODE)
+```
+
+# Run the simulation
+
+The default run uses 18 Monte Carlo replications, matching the paper-scale
+experiment.  For a quick GitHub test, set `NREP <- 2` or `NREP <- 3` before
+calling `run_simulation()`.
+
+```{r run-simulation}
+result <- run_simulation(
+  n = N, snr = SNR, sigma = SIGMA, wavelet = WAVELET,
+  j0 = J0, nrep = NREP, seed = SEED, n_iter = N_ITER,
+  weight_mode = WEIGHT_MODE, output_dir = OUTPUT_DIR
+)
+result$summary
+```
+
+# Figures
+
+The R script writes figures to `outputs_R/`.  They are shown below after the
+simulation has been run.
+
+```{r figure-one-rep, out.width="100%"}
+knitr::include_graphics(file.path(OUTPUT_DIR, "fig01_one_replication.png"))
+```
+
+```{r figure-weights, out.width="75%"}
+knitr::include_graphics(file.path(OUTPUT_DIR, "fig02_feature_weights.png"))
+```
+
+```{r figure-mask, out.width="100%"}
+knitr::include_graphics(file.path(OUTPUT_DIR, "fig03_split_mask.png"))
+```
+
+```{r figure-thresholds, out.width="75%"}
+knitr::include_graphics(file.path(OUTPUT_DIR, "fig04_thresholds.png"))
+```
+
+```{r figure-cv, out.width="75%"}
+knitr::include_graphics(file.path(OUTPUT_DIR, "fig05_cv_curve.png"))
+```
+
+```{r figure-amse, out.width="85%"}
+knitr::include_graphics(file.path(OUTPUT_DIR, "fig06_amse_bar.png"))
+```
+
+# Interpretation
+
+The comparison is deliberately narrow.  The fixed-threshold MaxTwin version is
+included as a diagnostic: changing the split geometry alone is not enough.  The
+successful construction combines three elements:
+
+1. a WMaxTwin split whose geometry emphasizes local high-frequency activity,
+2. a masked wavelet fit that is valid for the nonconforming training mask,
+3. a one-parameter high-frequency ramp threshold family selected by symmetric
+   cross-validation.
+
+This is the practical lesson of the example.  WMaxTwin is not merely a different
+odd/even split.  It is MaxTwin performed in a wavelet-informed feature geometry,
+paired with an estimator that respects the resulting mask.
